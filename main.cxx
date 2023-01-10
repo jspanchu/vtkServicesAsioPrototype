@@ -166,21 +166,26 @@ public:
   ~Connection() { vtkLog(TRACE, << "Connection destroyed"); }
   tcp::socket &Socket();
 
-  // Write/read message to/from the underlying socket for this connection.
+  // Read message from the underlying socket for this connection.
   void AsyncRead();
-  void AsyncWrite(const std::string &message);
-
-  // handle completed read of header.
-  void HandleReadHeader(const error_code &ec);
-  // handle completed read of data.
-  void HandleReadData(const error_code &ec);
+  // Post an async write
+  void PostWrite(const std::string &message);
 
   // read handler
-  std::function<void(const error_code &ec, const std::vector<char>& message)> OnRead = nullptr;
+  std::function<void(const error_code &ec, const std::vector<char> &message)>
+      OnRead = nullptr;
   // write handler
   std::function<void(const error_code &ec)> OnWrite = nullptr;
   // error handler
   std::function<void(const error_code &ec)> OnError = nullptr;
+
+protected:
+  // do the actual async write
+  void AsyncWrite();
+  // handle completed read of header.
+  void HandleReadHeader(const error_code &ec);
+  // handle completed read of data.
+  void HandleReadData(const error_code &ec);
 
 private:
   // socket used to read, write data
@@ -193,6 +198,8 @@ private:
   std::vector<char> mInboundData;
   // used to post execution of read, write, error handlers.
   io::io_context &mIOCtx;
+  // queue of outbound messages.
+  std::deque<std::string> mOutboundQueue;
 };
 
 using ConnectionPtr = std::shared_ptr<Connection>;
@@ -209,8 +216,8 @@ tcp::socket &Connection::Socket() { return this->mSocket; }
 void Connection::AsyncRead() {
   // Issue a read operation to read exactly the number of bytes in a header.
   asio::async_read(this->mSocket, asio::buffer(this->mInboundHeader),
-                   [this, self = shared_from_this()](
-                       const error_code &ec, std::size_t /*length*/) {
+                   [this, self = shared_from_this()](const error_code &ec,
+                                                     std::size_t /*length*/) {
                      this->HandleReadHeader(ec);
                    });
 }
@@ -220,11 +227,6 @@ void Connection::HandleReadHeader(const error_code &ec) {
   if (ec) {
     vtkLog(ERROR, << "Failed to read header. Closing socket.");
     this->mSocket.close();
-    if (this->OnError) {
-      this->OnError(ec);
-    } else {
-      throw ec;
-    }
   } else {
     // determine length of data.
     std::istringstream is(
@@ -245,8 +247,8 @@ void Connection::HandleReadHeader(const error_code &ec) {
     // start an async read of the data.
     this->mInboundData.resize(inboundDataSize);
     asio::async_read(this->mSocket, asio::buffer(this->mInboundData),
-                     [this, self = shared_from_this()](
-                         const error_code &ec, std::size_t /*length*/) {
+                     [this, self = shared_from_this()](const error_code &ec,
+                                                       std::size_t /*length*/) {
                        this->HandleReadData(ec);
                      });
   }
@@ -257,11 +259,6 @@ void Connection::HandleReadData(const error_code &ec) {
   if (ec) {
     vtkLog(ERROR, << "Failed to read data. Closing socket.");
     this->mSocket.close();
-    if (this->OnError) {
-      this->OnError(ec);
-    } else {
-      throw ec;
-    }
   } else {
     // extract the message from the data.
     vtkLog(TRACE, "Read " << std::string(this->mInboundData.begin(),
@@ -276,9 +273,20 @@ void Connection::HandleReadData(const error_code &ec) {
 }
 
 //-------------------------------------------------------------------
-void Connection::AsyncWrite(const std::string &message) {
+void Connection::PostWrite(const std::string &message) {
+  asio::post(this->mIOCtx, [this, message]() {
+    bool idle = this->mOutboundQueue.empty();
+    this->mOutboundQueue.push_back(message);
+    if (idle) {
+      this->AsyncWrite();
+    }
+  });
+}
+
+//-------------------------------------------------------------------
+void Connection::AsyncWrite() {
   // format the header.
-  const std::string &outboundData = message;
+  const std::string &outboundData = this->mOutboundQueue.front();
   std::ostringstream headerStream;
   headerStream << std::setw(mHeaderlength) << std::hex << outboundData.size();
   if ((!headerStream || headerStream.str().size() != mHeaderlength) &&
@@ -300,13 +308,14 @@ void Connection::AsyncWrite(const std::string &message) {
                         vtkLog(ERROR,
                                << "Failed to write message. Closing socket.");
                         this->mSocket.close();
-                        if (this->OnError) {
-                          this->OnError(ec);
-                        } else {
-                          throw ec;
+                      } else {
+                        if (this->OnWrite != nullptr) {
+                          this->OnWrite(ec);
                         }
-                      } else if (this->OnWrite != nullptr) {
-                        this->OnWrite(ec);
+                        this->mOutboundQueue.pop_front();
+                        if (!this->mOutboundQueue.empty()) {
+                          this->AsyncWrite();
+                        }
                       }
                     });
 }
@@ -322,7 +331,7 @@ protected:
   // handle completion of a connect operation
   void HandleConnect(const error_code &ec, tcp::endpoint ep);
   // handle completion a `Connection::AsyncRead` operation.
-  void HandleRead(const error_code &ec, const std::vector<char>& message);
+  void HandleRead(const error_code &ec, const std::vector<char> &message);
   // handle completion a `Connection::AsyncWrite` operation.
   void HandleWrite(const error_code &ec);
 
@@ -383,7 +392,8 @@ void Client::HandleConnect(const error_code &ec, tcp::endpoint ep) {
 }
 
 //-------------------------------------------------------------------
-void Client::HandleRead(const error_code &ec, const std::vector<char>& message) {
+void Client::HandleRead(const error_code &ec,
+                        const std::vector<char> &message) {
   if (ec) {
     return;
   }
@@ -405,12 +415,13 @@ void Client::HandleRead(const error_code &ec, const std::vector<char>& message) 
         // .observe_on(rxcpp::observe_on_new_thread())
         .subscribe([this](std::string msg) {
           // vtkLogger::SetThreadName("comm.send");
-          this->mConnection->AsyncWrite(msg);
+          this->mConnection->PostWrite(msg);
           this->mCommunicator.sendCounter++;
         });
   } else {
     // push message into recvSubject.
-    this->mCommunicator.recvSbjct.get_subscriber().on_next(std::string(message.begin(), message.end()));
+    this->mCommunicator.recvSbjct.get_subscriber().on_next(
+        std::string(message.begin(), message.end()));
   }
   this->mConnection->AsyncRead();
 }
@@ -437,7 +448,7 @@ protected:
   // handle completion of an accept operation.
   void HandleAccept(const error_code &ec, ConnectionPtr connection);
   // handle completion a `Connection::AsyncRead` operation.
-  void HandleRead(const error_code &ec, const std::vector<char>& message);
+  void HandleRead(const error_code &ec, const std::vector<char> &message);
   // handle completion a `Connection::AsyncWrite` operation.
   void HandleWrite(const error_code &ec);
 
@@ -519,7 +530,7 @@ void Server::HandleAccept(const error_code &ec, ConnectionPtr connection) {
     std::string serviceRegistryMessage =
         vtk_services::ToHex("paraview") +
         vtk_services::ToText(this->mServiceRegistry);
-    connection->AsyncWrite(serviceRegistryMessage);
+    connection->PostWrite(serviceRegistryMessage);
     this->mCommunicator.sendSbjct
         .get_observable()
         // enqueue on main thread.
@@ -528,7 +539,7 @@ void Server::HandleAccept(const error_code &ec, ConnectionPtr connection) {
         // .observe_on(rxcpp::observe_on_new_thread())
         .subscribe([this](std::string msg) {
           // vtkLogger::SetThreadName("comm.send");
-          this->mConnection->AsyncWrite(msg);
+          this->mConnection->PostWrite(msg);
           this->mCommunicator.sendCounter++;
         });
     connection->AsyncRead();
@@ -540,10 +551,12 @@ void Server::HandleAccept(const error_code &ec, ConnectionPtr connection) {
 }
 
 //-------------------------------------------------------------------
-void Server::HandleRead(const error_code &ec, const std::vector<char>& message) {
+void Server::HandleRead(const error_code &ec,
+                        const std::vector<char> &message) {
   if (!ec) {
     // push message into recvSubject.
-    this->mCommunicator.recvSbjct.get_subscriber().on_next(std::string(message.begin(), message.end()));
+    this->mCommunicator.recvSbjct.get_subscriber().on_next(
+        std::string(message.begin(), message.end()));
     this->mConnection->AsyncRead();
   }
 }
